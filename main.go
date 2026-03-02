@@ -14,6 +14,14 @@ func main() {
 	})
 
 	r.GET("/dns", handlers.GetDNSInfo)
+    // Certificate routes
+	cert := r.Group("/cert")
+	{
+		cert.POST("/generate", handlers.GenerateCertbotCert)
+		cert.POST("/renew", handlers.RenewCertbotCert)
+		cert.DELETE("/delete", handlers.DeleteCertbotCert)
+		cert.GET("/list", handlers.ListCertbotCerts)
+	}
 
 	log.Println("Server running!")
 	r.Run(":8080")
