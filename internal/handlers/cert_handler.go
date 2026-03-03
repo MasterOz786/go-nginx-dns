@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -315,7 +316,11 @@ func prepareSiteStorage(domain string) (string, error) {
 }
 
 // storeUploadedFiles handles the common multipart file handling logic used by
-// both StoreFiles and GenerateAndStoreNginxConfig.
+// both StoreFiles and GenerateAndStoreNginxConfig. It writes each provided
+// file to disk under storageDir. If an uploaded file is a zip archive it is
+// automatically uncompressed into the target directory (the file itself is
+// discarded). This allows clients to effectively upload entire folder
+// hierarchies in a single form field.
 func storeUploadedFiles(c *gin.Context, storageDir string) ([]string, []string, error) {
 	form, _ := c.MultipartForm()
 	files := form.File["files"]
@@ -327,25 +332,46 @@ func storeUploadedFiles(c *gin.Context, storageDir string) ([]string, []string, 
 	var failed []string
 
 	for _, file := range files {
+		filename := filepath.Base(file.Filename)
+		ext := strings.ToLower(filepath.Ext(filename))
+
 		src, err := file.Open()
 		if err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", file.Filename, err))
+			failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
 			continue
 		}
 		defer src.Close()
 
-		filename := filepath.Base(file.Filename)
-		filePath := filepath.Join(storageDir, filename)
+		if ext == ".zip" {
+			// write to temporary location then unzip
+			tmp, err := ioutil.TempFile("", "upload-*.zip")
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+				src.Close()
+				continue
+			}
+			io.Copy(tmp, src)
+			tmp.Close()
+			if err := unzipToDir(tmp.Name(), storageDir); err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+			} else {
+				stored = append(stored, filename+" (unzipped)")
+			}
+			os.Remove(tmp.Name())
+			continue
+		}
 
+		// normal file
+		filePath := filepath.Join(storageDir, filename)
 		dst, err := os.Create(filePath)
 		if err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", file.Filename, err))
+			failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
 			continue
 		}
 		defer dst.Close()
 
 		if _, err := io.Copy(dst, src); err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", file.Filename, err))
+			failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
 			continue
 		}
 
