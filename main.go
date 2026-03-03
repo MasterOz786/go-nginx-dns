@@ -2,8 +2,9 @@ package main
 
 import (
 	"log"
-	"github.com/gin-gonic/gin"
+
 	"github.com/MasterOz786/go-nginx-dns/internal/handlers"
+	"github.com/gin-gonic/gin"
 )
 
 func main() {
@@ -14,7 +15,7 @@ func main() {
 	})
 
 	r.GET("/dns", handlers.GetDNSInfo)
-    // Certificate routes
+	// Certificate routes
 	cert := r.Group("/cert")
 	{
 		cert.POST("/generate", handlers.GenerateCertbotCert)
@@ -22,6 +23,10 @@ func main() {
 		cert.DELETE("/delete", handlers.DeleteCertbotCert)
 		cert.GET("/list", handlers.ListCertbotCerts)
 	}
+
+	// File storage route (requires certificate verification)
+	r.POST("/storage/store", handlers.StoreFiles)
+	r.POST("/storage/nginx", handlers.GenerateAndStoreNginxConfig)
 
 	log.Println("Server running!")
 	r.Run(":8080")
