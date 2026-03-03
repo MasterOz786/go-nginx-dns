@@ -10,10 +10,16 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// base directory where site content is stored. This is expected to be
-// the "sites" directory at the root of the workspace. It can be overridden
-// by setting an environment variable if needed in the future.
-var sitesBasePath = "./sites"
+// base directory where site content is stored. This defaults to
+// environment variable (the running nginx container uses
+// /var/www/html/sites).
+var sitesBasePath = "/var/www/html/sites"
+
+func init() {
+	if env := os.Getenv("SITE_BASE_PATH"); env != "" {
+		sitesBasePath = env
+	}
+}
 
 // ListSites returns the names of the top-level entries under the sites
 // directory. This includes both subdirectories (individual sites) and

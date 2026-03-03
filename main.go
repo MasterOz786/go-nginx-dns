@@ -7,8 +7,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func main() {
-	r := gin.Default()
+// setupServer constructs and returns a Gin engine preconfigured with all
+// routes. Tests can call this helper directly.
+func setupServer() *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery())
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "OK"})
@@ -17,6 +20,7 @@ func main() {
 	// DNS info route was mainly a stub; its functionality has been merged
 	// into /health, so we no longer expose a separate endpoint.
 	// r.GET("/dns", handlers.GetDNSInfo)
+
 	// Certificate routes
 	cert := r.Group("/cert")
 	{
@@ -39,6 +43,11 @@ func main() {
 	// wildcard route for site contents; filepath is optional
 	r.GET("/sites/:site/*filepath", handlers.ServeSite)
 
+	return r
+}
+
+func main() {
+	r := setupServer()
 	log.Println("Server running!")
 	r.Run(":8080")
 }
