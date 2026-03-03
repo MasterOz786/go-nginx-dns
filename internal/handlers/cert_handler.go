@@ -228,42 +228,28 @@ func parseCertbotOutput(output string) []map[string]interface{} {
 
 // Verify if certificate is valid and verified for a domain
 func verifyCertificateForDomain(domain string) (bool, string) {
-	// Get certificate information from certbot
-	cmd := exec.Command("certbot", "certificates")
-	output, err := cmd.CombinedOutput()
+	// locate cert path (and implicitly ensure cert exists)
+	certPath, _, err := getCertificateAndKeyPaths(domain)
 	if err != nil {
-		return false, "Failed to query certificates"
+		return false, err.Error()
 	}
 
-	certOutput := string(output)
-
-	// Check if domain is in the certificates list
-	if !strings.Contains(certOutput, domain) {
-		return false, fmt.Sprintf("Certificate not found for domain: %s", domain)
-	}
-
-	// Find the certificate path by parsing certbot output
-	certPath := getCertificatePath(certOutput, domain)
-	if certPath == "" {
-		return false, fmt.Sprintf("Could not determine certificate path for domain: %s", domain)
-	}
-
-	// Verify certificate is not expired
-	cmd = exec.Command("openssl", "x509", "-in", certPath, "-noout", "-checkend", "0")
-	err = cmd.Run()
-	if err != nil {
+	// make sure the certificate hasn't expired
+	cmd := exec.Command("openssl", "x509", "-in", certPath, "-noout", "-checkend", "0")
+	if err := cmd.Run(); err != nil {
 		return false, fmt.Sprintf("Certificate is expired or invalid for domain: %s", domain)
 	}
 
-	// Verify certificate is properly signed and contains the domain
+	// verify the certificate text contains the domain (plain or www)
 	cmd = exec.Command("openssl", "x509", "-in", certPath, "-noout", "-text")
-	output, err = cmd.CombinedOutput()
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return false, "Failed to verify certificate validity"
 	}
 
 	certText := string(output)
-	if !strings.Contains(certText, domain) && !strings.Contains(certText, "*"+domain) {
+	base := strings.TrimPrefix(domain, "www.")
+	if !strings.Contains(certText, domain) && !strings.Contains(certText, base) && !strings.Contains(certText, "*"+base) {
 		return false, fmt.Sprintf("Certificate is not verified for domain: %s", domain)
 	}
 
@@ -386,7 +372,7 @@ func StoreFiles(c *gin.Context) {
 	c.JSON(200, response)
 }
 
-// Get certificate and key paths for a domain
+// Get certificate and key paths for a domain (handles plain and www variants)
 func getCertificateAndKeyPaths(domain string) (string, string, error) {
 	cmd := exec.Command("certbot", "certificates")
 	output, err := cmd.CombinedOutput()
@@ -394,42 +380,36 @@ func getCertificateAndKeyPaths(domain string) (string, string, error) {
 		return "", "", fmt.Errorf("failed to query certificates")
 	}
 
-	certOutput := string(output)
-	lines := strings.Split(certOutput, "\n")
-	var certPath, keyPath string
-	var inCertBlock bool
+	certs := parseCertbotOutput(string(output))
 
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		if strings.Contains(line, "Certificate Name:") && strings.Contains(line, domain) {
-			inCertBlock = true
+	// helper to match both with and without www prefix
+	match := func(d string) bool {
+		if d == domain {
+			return true
 		}
+		// ensure consistent www prefix
+		base := strings.TrimPrefix(domain, "www.")
+		if d == base || d == "www."+base {
+			return true
+		}
+		return false
+	}
 
-		if inCertBlock {
-			if strings.Contains(line, "Certificate Path:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					certPath = strings.TrimSpace(parts[1])
+	for _, cert := range certs {
+		if domains, ok := cert["domains"].([]string); ok {
+			for _, d := range domains {
+				if match(d) {
+					certPath, _ := cert["cert_path"].(string)
+					keyPath, _ := cert["key_path"].(string)
+					if certPath != "" && keyPath != "" {
+						return certPath, keyPath, nil
+					}
 				}
-			} else if strings.Contains(line, "Private Key Path:") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
-					keyPath = strings.TrimSpace(parts[1])
-				}
-			}
-
-			if certPath != "" && keyPath != "" {
-				break
 			}
 		}
 	}
 
-	if certPath == "" || keyPath == "" {
-		return "", "", fmt.Errorf("could not find certificate paths for domain: %s", domain)
-	}
-
-	return certPath, keyPath, nil
+	return "", "", fmt.Errorf("could not find certificate paths for domain: %s", domain)
 }
 
 // Generate HTTPS nginx configuration
@@ -556,9 +536,23 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 
 	// Define nginx config file path
 	configFilename := domain + ".conf"
-	configPath := filepath.Join(storageDir, configFilename)
 
 	// Write nginx configuration to file
+	// Write config to sites-available and enable it in sites-enabled
+	sitesAvailable := "/etc/nginx/sites-available"
+	sitesEnabled := "/etc/nginx/sites-enabled"
+
+	if err := os.MkdirAll(sitesAvailable, 0755); err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to create %s: %v", sitesAvailable, err)})
+		return
+	}
+
+	if err := os.MkdirAll(sitesEnabled, 0755); err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to create %s: %v", sitesEnabled, err)})
+		return
+	}
+
+	configPath := filepath.Join(sitesAvailable, configFilename)
 	if err := os.WriteFile(configPath, []byte(nginxConfig), 0644); err != nil {
 		c.JSON(500, gin.H{
 			"status": "error",
@@ -567,7 +561,18 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		return
 	}
 
-	// Also store any additional files provided
+	// Create or replace symlink in sites-enabled
+	enabledPath := filepath.Join(sitesEnabled, configFilename)
+	// remove existing file/symlink if present
+	if _, err := os.Lstat(enabledPath); err == nil {
+		_ = os.Remove(enabledPath)
+	}
+	if err := os.Symlink(configPath, enabledPath); err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to enable site: %v", err)})
+		return
+	}
+
+	// Also store any additional files provided (in /var/www/html)
 	form, _ := c.MultipartForm()
 	files := form.File["files"]
 
@@ -606,18 +611,47 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"status":     "success",
-		"domain":     domain,
-		"path":       "/var/www/html",
-		"nginx_conf": configFilename,
-		"stored":     storedFiles,
-		"cert_path":  certPath,
-		"key_path":   keyPath,
-		"message":    "Nginx configuration generated and files stored successfully",
+		"status":          "success",
+		"domain":          domain,
+		"path":            "/var/www/html",
+		"nginx_conf":      configFilename,
+		"sites_available": configPath,
+		"sites_enabled":   enabledPath,
+		"stored":          storedFiles,
+		"cert_path":       certPath,
+		"key_path":        keyPath,
+		"message":         "Nginx configuration generated and files stored successfully",
 	}
 
 	if len(failedFiles) > 0 {
 		response["failed"] = failedFiles
+	}
+
+	// Test nginx configuration
+	nginxTestCmd := exec.Command("nginx", "-t")
+	testOut, testErr := nginxTestCmd.CombinedOutput()
+	if testErr != nil {
+		response["nginx_test"] = string(testOut)
+		response["nginx_reload"] = "skipped"
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("nginx -t failed: %s", string(testOut)), "details": response})
+		return
+	}
+
+	// Try to reload nginx (prefer systemctl, fallback to nginx -s reload)
+	reloadErr := exec.Command("systemctl", "reload", "nginx").Run()
+	reloadMethod := "systemctl reload nginx"
+	if reloadErr != nil {
+		// fallback
+		reloadErr = exec.Command("nginx", "-s", "reload").Run()
+		reloadMethod = "nginx -s reload"
+	}
+
+	if reloadErr != nil {
+		response["nginx_test"] = string(testOut)
+		response["nginx_reload"] = fmt.Sprintf("failed (%s)", reloadMethod)
+	} else {
+		response["nginx_test"] = string(testOut)
+		response["nginx_reload"] = fmt.Sprintf("success (%s)", reloadMethod)
 	}
 
 	c.JSON(200, response)
