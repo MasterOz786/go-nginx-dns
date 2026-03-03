@@ -414,15 +414,17 @@ func getCertificateAndKeyPaths(domain string) (string, string, error) {
 
 // Generate HTTPS nginx configuration
 func generateNginxConfig(domain string, certPath, keyPath string) string {
+	// normalize names
+	base := strings.TrimPrefix(domain, "www.")
+	www := "www." + base
 	nginxTemplate := `
-    # HTTPS Nginx configuration for {{.Domain}}
+    # HTTPS Nginx configuration for ` + base + `
     # Generated automatically - Certificate verified
 
 server {
     listen 80;
     listen [::]:80;
-    server_name {{.Domain}} www.{{.Domain}};
-    
+    server_name ` + base + ` ` + www + `;
     # Redirect HTTP to HTTPS
     return 301 https://$server_name$request_uri;
 }
@@ -467,14 +469,18 @@ server {
 		return ""
 	}
 
+	// pass both forms if needed
+	base = strings.TrimPrefix(domain, "www.")
 	data := struct {
-		Domain   string
-		CertPath string
-		KeyPath  string
+		Domain    string
+		WWWDomain string
+		CertPath  string
+		KeyPath   string
 	}{
-		Domain:   domain,
-		CertPath: certPath,
-		KeyPath:  keyPath,
+		Domain:    base,
+		WWWDomain: "www." + base,
+		CertPath:  certPath,
+		KeyPath:   keyPath,
 	}
 
 	var buf strings.Builder
@@ -484,6 +490,25 @@ server {
 	}
 
 	return buf.String()
+}
+
+// copyFile duplicates source to destination
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	if err != nil {
+		return err
+	}
+	return out.Sync()
 }
 
 // Generate and store nginx configuration after certificate verification
@@ -580,7 +605,17 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	var failedFiles []string
 
 	storedFiles = append(storedFiles, configFilename)
-
+	// if a single file was uploaded and it's not index.html, duplicate it as index.html for root
+	if len(files) == 1 {
+		single := filepath.Base(files[0].Filename)
+		if single != "index.html" {
+			src := filepath.Join(storageDir, single)
+			dst := filepath.Join(storageDir, "index.html")
+			// ignore errors
+			_ = copyFile(src, dst)
+			storedFiles = append(storedFiles, "index.html")
+		}
+	}
 	// Store each additional file
 	for _, file := range files {
 		src, err := file.Open()
