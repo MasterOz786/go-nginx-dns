@@ -285,90 +285,100 @@ func getCertificatePath(certOutput string, domain string) string {
 	return ""
 }
 
-// Store files in /var/www/html after certificate verification
-func StoreFiles(c *gin.Context) {
-	domain := c.PostForm("domain")
+// prepareSiteStorage verifies the certificate for the given domain and
+// returns an appropriate storage directory (preferring ./sites/<domain> when
+// it exists). An error is returned if the certificate check fails or the
+// directory cannot be created.
+func prepareSiteStorage(domain string) (string, error) {
 	if domain == "" {
-		c.JSON(400, gin.H{"status": "error", "error": "domain parameter required"})
-		return
+		return "", fmt.Errorf("domain parameter required")
 	}
 
-	// Verify certificate exists and is valid
 	isValid, verifyMsg := verifyCertificateForDomain(domain)
 	if !isValid {
-		c.JSON(400, gin.H{
-			"status": "error",
-			"error":  verifyMsg,
-		})
-		return
+		return "", fmt.Errorf(verifyMsg)
 	}
 
-	// Create directory if it doesn't exist
 	storageDir := "/var/www/html"
-	if err := os.MkdirAll(storageDir, 0755); err != nil {
-		c.JSON(500, gin.H{
-			"status": "error",
-			"error":  fmt.Sprintf("Failed to create directory: %v", err),
-		})
-		return
+	if alt := filepath.Join(sitesBasePath, domain); func() bool {
+		if _, err := os.Stat(alt); err == nil {
+			return true
+		}
+		return false
+	}() {
+		storageDir = filepath.Join(sitesBasePath, domain)
 	}
+	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		return "", err
+	}
+	return storageDir, nil
+}
 
-	// Get form files
+// storeUploadedFiles handles the common multipart file handling logic used by
+// both StoreFiles and GenerateAndStoreNginxConfig.
+func storeUploadedFiles(c *gin.Context, storageDir string) ([]string, []string, error) {
 	form, _ := c.MultipartForm()
 	files := form.File["files"]
-
 	if len(files) == 0 {
-		c.JSON(400, gin.H{
-			"status": "error",
-			"error":  "No files provided",
-		})
-		return
+		return nil, nil, fmt.Errorf("no files provided")
 	}
 
-	var storedFiles []string
-	var failedFiles []string
+	var stored []string
+	var failed []string
 
-	// Store each file
 	for _, file := range files {
 		src, err := file.Open()
 		if err != nil {
-			failedFiles = append(failedFiles, fmt.Sprintf("%s: %v", file.Filename, err))
+			failed = append(failed, fmt.Sprintf("%s: %v", file.Filename, err))
 			continue
 		}
 		defer src.Close()
 
-		// Sanitize filename to prevent directory traversal
 		filename := filepath.Base(file.Filename)
 		filePath := filepath.Join(storageDir, filename)
 
 		dst, err := os.Create(filePath)
 		if err != nil {
-			failedFiles = append(failedFiles, fmt.Sprintf("%s: %v", file.Filename, err))
+			failed = append(failed, fmt.Sprintf("%s: %v", file.Filename, err))
 			continue
 		}
 		defer dst.Close()
 
-		// Copy file contents
 		if _, err := io.Copy(dst, src); err != nil {
-			failedFiles = append(failedFiles, fmt.Sprintf("%s: %v", file.Filename, err))
+			failed = append(failed, fmt.Sprintf("%s: %v", file.Filename, err))
 			continue
 		}
 
-		storedFiles = append(storedFiles, filename)
+		stored = append(stored, filename)
+	}
+	return stored, failed, nil
+}
+
+// Store files in /var/www/html after certificate verification
+func StoreFiles(c *gin.Context) {
+	domain := c.PostForm("domain")
+	storageDir, err := prepareSiteStorage(domain)
+	if err != nil {
+		c.JSON(400, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	storedFiles, failedFiles, fileErr := storeUploadedFiles(c, storageDir)
+	if fileErr != nil {
+		c.JSON(400, gin.H{"status": "error", "error": fileErr.Error()})
+		return
 	}
 
 	response := gin.H{
 		"status":  "success",
 		"domain":  domain,
-		"path":    "/var/www/html",
+		"path":    storageDir,
 		"stored":  storedFiles,
 		"message": "Files stored successfully after certificate verification",
 	}
-
 	if len(failedFiles) > 0 {
 		response["failed"] = failedFiles
 	}
-
 	c.JSON(200, response)
 }
 
@@ -413,10 +423,13 @@ func getCertificateAndKeyPaths(domain string) (string, string, error) {
 }
 
 // Generate HTTPS nginx configuration
-func generateNginxConfig(domain string, certPath, keyPath string) string {
+func generateNginxConfig(domain string, certPath, keyPath, indexName string) string {
 	// normalize names
 	base := strings.TrimPrefix(domain, "www.")
 	www := "www." + base
+	if indexName == "" {
+		indexName = "index.html"
+	}
 	nginxTemplate := `
     # HTTPS Nginx configuration for ` + base + `
     # Generated automatically - Certificate verified
@@ -445,7 +458,7 @@ server {
     
     # Root directory for serving files
     root /var/www/html;
-    index index.html index.htm;
+    index {{.Index}};
     
     # Access and error logs
     access_log /var/log/nginx/{{.Domain}}_access.log;
@@ -476,11 +489,13 @@ server {
 		WWWDomain string
 		CertPath  string
 		KeyPath   string
+		Index     string
 	}{
 		Domain:    base,
 		WWWDomain: "www." + base,
 		CertPath:  certPath,
 		KeyPath:   keyPath,
+		Index:     indexName,
 	}
 
 	var buf strings.Builder
@@ -540,7 +555,8 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	}
 
 	// Generate nginx configuration
-	nginxConfig := generateNginxConfig(domain, certPath, keyPath)
+	indexName := c.PostForm("index")
+	nginxConfig := generateNginxConfig(domain, certPath, keyPath, indexName)
 	if nginxConfig == "" {
 		c.JSON(500, gin.H{
 			"status": "error",
@@ -549,17 +565,14 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		return
 	}
 
-	// Create directory if it doesn't exist
-	storageDir := "/var/www/html"
-	if err := os.MkdirAll(storageDir, 0755); err != nil {
-		c.JSON(500, gin.H{
-			"status": "error",
-			"error":  fmt.Sprintf("Failed to create directory: %v", err),
-		})
+	// prepare storage directory and verify cert
+	storageDir, err := prepareSiteStorage(domain)
+	if err != nil {
+		c.JSON(400, gin.H{"status": "error", "error": err.Error()})
 		return
 	}
 
-	// Define nginx config file path
+	// config filename used in several places below
 	configFilename := domain + ".conf"
 
 	// Write nginx configuration to file
@@ -597,52 +610,30 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		return
 	}
 
-	// Also store any additional files provided (in /var/www/html)
-	form, _ := c.MultipartForm()
-	files := form.File["files"]
-
-	var storedFiles []string
-	var failedFiles []string
-
-	storedFiles = append(storedFiles, configFilename)
-	// if a single file was uploaded and it's not index.html, duplicate it as index.html for root
-	if len(files) == 1 {
-		single := filepath.Base(files[0].Filename)
-		if single != "index.html" {
-			src := filepath.Join(storageDir, single)
-			dst := filepath.Join(storageDir, "index.html")
-			// ignore errors
-			_ = copyFile(src, dst)
-			storedFiles = append(storedFiles, "index.html")
-		}
+	// Also store any additional files provided
+	storedFiles, failedFiles, fileErr := storeUploadedFiles(c, storageDir)
+	if fileErr != nil && fileErr.Error() != "no files provided" {
+		c.JSON(400, gin.H{"status": "error", "error": fileErr.Error()})
+		return
 	}
-	// Store each additional file
-	for _, file := range files {
-		src, err := file.Open()
-		if err != nil {
-			failedFiles = append(failedFiles, fmt.Sprintf("%s: %v", file.Filename, err))
-			continue
-		}
-		defer src.Close()
 
-		// Sanitize filename to prevent directory traversal
-		filename := filepath.Base(file.Filename)
-		filePath := filepath.Join(storageDir, filename)
+	// ensure config filename is reported
+	if storedFiles == nil {
+		storedFiles = []string{}
+	}
+	storedFiles = append([]string{configFilename}, storedFiles...)
 
-		dst, err := os.Create(filePath)
-		if err != nil {
-			failedFiles = append(failedFiles, fmt.Sprintf("%s: %v", file.Filename, err))
-			continue
-		}
-		defer dst.Close()
-
-		// Copy file contents
-		if _, err := io.Copy(dst, src); err != nil {
-			failedFiles = append(failedFiles, fmt.Sprintf("%s: %v", file.Filename, err))
-			continue
-		}
-
-		storedFiles = append(storedFiles, filename)
+	// handle index renaming logic as before
+	if indexName == "" {
+		indexName = "index.html"
+	}
+	// if a single file was uploaded and its name doesn't match index, copy it
+	// this replicates the earlier behaviour but now uses storedFiles slice
+	if len(storedFiles) == 2 && storedFiles[1] != indexName {
+		src := filepath.Join(storageDir, storedFiles[1])
+		dst := filepath.Join(storageDir, indexName)
+		_ = copyFile(src, dst)
+		storedFiles = append(storedFiles, indexName)
 	}
 
 	response := gin.H{
@@ -652,6 +643,7 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		"nginx_conf":      configFilename,
 		"sites_available": configPath,
 		"sites_enabled":   enabledPath,
+		"index_file":      indexName,
 		"stored":          storedFiles,
 		"cert_path":       certPath,
 		"key_path":        keyPath,
