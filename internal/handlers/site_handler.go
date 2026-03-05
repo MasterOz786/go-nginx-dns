@@ -1,7 +1,11 @@
 package handlers
 
 import (
+	"archive/zip"
 	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -169,4 +173,174 @@ func GetSiteInfo(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "success", "site": site, "info": info})
+}
+
+// prepareSiteStorage verifies the certificate for the given domain and
+// returns an appropriate storage directory (preferring ./sites/<domain> when
+// it exists). An error is returned if the certificate check fails or the
+// directory cannot be created.
+func prepareSiteStorage(domain string) (string, error) {
+	if domain == "" {
+		return "", fmt.Errorf("domain parameter required")
+	}
+
+	isValid, verifyMsg := verifyCertificateForDomain(domain)
+	if !isValid {
+		return "", fmt.Errorf("%s", verifyMsg)
+	}
+
+	storageDir := "/var/www/html"
+	if alt := filepath.Join(sitesBasePath, domain); func() bool {
+		if _, err := os.Stat(alt); err == nil {
+			return true
+		}
+		return false
+	}() {
+		storageDir = filepath.Join(sitesBasePath, domain)
+	}
+	if err := os.MkdirAll(storageDir, 0755); err != nil {
+		return "", err
+	}
+	return storageDir, nil
+}
+
+// storeUploadedFiles handles the common multipart file handling logic used by
+// both StoreFiles and GenerateAndStoreNginxConfig. It writes each provided
+// file to disk under storageDir. If an uploaded file is a zip archive it is
+// automatically uncompressed into the target directory (the file itself is
+// discarded). This allows clients to effectively upload entire folder
+// hierarchies in a single form field.
+func storeUploadedFiles(c *gin.Context, storageDir string) ([]string, []string, error) {
+	form, _ := c.MultipartForm()
+	files := form.File["files"]
+	if len(files) == 0 {
+		return nil, nil, fmt.Errorf("no files provided")
+	}
+
+	var stored []string
+	var failed []string
+
+	for _, file := range files {
+		filename := filepath.Base(file.Filename)
+		ext := strings.ToLower(filepath.Ext(filename))
+
+		src, err := file.Open()
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+			continue
+		}
+		defer src.Close()
+
+		if ext == ".zip" {
+			tmp, err := ioutil.TempFile("", "upload-*.zip")
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+				src.Close()
+				continue
+			}
+			io.Copy(tmp, src)
+			tmp.Close()
+			if err := unzipToDir(tmp.Name(), storageDir); err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+			} else {
+				stored = append(stored, filename+" (unzipped)")
+			}
+			os.Remove(tmp.Name())
+			continue
+		}
+
+		filePath := filepath.Join(storageDir, filename)
+		dst, err := os.Create(filePath)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+			continue
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, src); err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", filename, err))
+			continue
+		}
+
+		stored = append(stored, filename)
+	}
+	return stored, failed, nil
+}
+
+func unzipToDir(zipPath, destDir string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		cleanName := filepath.Clean(f.Name)
+		if strings.Contains(cleanName, "..") {
+			continue
+		}
+
+		targetPath := filepath.Join(destDir, cleanName)
+		if !strings.HasPrefix(targetPath, filepath.Clean(destDir)+string(os.PathSeparator)) && filepath.Clean(targetPath) != filepath.Clean(destDir) {
+			continue
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, f.Mode()); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+		if err != nil {
+			rc.Close()
+			return err
+		}
+
+		_, copyErr := io.Copy(outFile, rc)
+		rc.Close()
+		outFile.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+	}
+	return nil
+}
+
+// Store files in /var/www/html after certificate verification
+func StoreFiles(c *gin.Context) {
+	domain := c.PostForm("domain")
+	storageDir, err := prepareSiteStorage(domain)
+	if err != nil {
+		c.JSON(400, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	storedFiles, failedFiles, fileErr := storeUploadedFiles(c, storageDir)
+	if fileErr != nil {
+		c.JSON(400, gin.H{"status": "error", "error": fileErr.Error()})
+		return
+	}
+
+	response := gin.H{
+		"status":  "success",
+		"domain":  domain,
+		"path":    storageDir,
+		"stored":  storedFiles,
+		"message": "Files stored successfully after certificate verification",
+	}
+	if len(failedFiles) > 0 {
+		response["failed"] = failedFiles
+	}
+	c.JSON(200, response)
 }
