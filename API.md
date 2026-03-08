@@ -238,7 +238,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
 
 ### POST `/storage/nginx`
 
-- **Description:** Generate an HTTPS nginx config for the domain, write it to `/etc/nginx/sites-available`, create a symlink in `/etc/nginx/sites-enabled`, optionally store additional site files, and reload nginx.
+- **Description:** Generate an HTTPS nginx config for the domain, write it to `/etc/nginx/sites-available`, create a symlink in `/etc/nginx/sites-enabled`, ensure the per-site root directory exists at `/var/www/html/sites/<domain>`, optionally store additional site files into that directory, and reload nginx.
 
 - **Request (multipart/form-data):**
   - Fields:
@@ -246,7 +246,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
     - `index` (text, optional) – desired index file name; defaults to `index.html`.
     - `files` (optional; same semantics as `/storage/store`, supports `.zip`):
       - Send one or more files under the `files` field.
-      - `.zip` archives are extracted into the selected storage directory; the archive itself is not kept.
+      - `.zip` archives are extracted into `/var/www/html/sites/<domain-without-www>`; the archive itself is not kept.
       - Zipped subpaths are preserved, and the response will include `"yourfile.zip (unzipped)"` to indicate success.
 
 - **Example (curl):**
@@ -265,7 +265,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
     {
       "status": "success",
       "domain": "example.com",
-      "path": "/var/www/html",
+      "path": "/var/www/html/sites/example.com",
       "nginx_conf": "example.com.conf",
       "sites_available": "/etc/nginx/sites-available/example.com.conf",
       "sites_enabled": "/etc/nginx/sites-enabled/example.com.conf",

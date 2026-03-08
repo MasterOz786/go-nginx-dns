@@ -189,15 +189,8 @@ func prepareSiteStorage(domain string) (string, error) {
 		return "", fmt.Errorf("%s", verifyMsg)
 	}
 
-	storageDir := "/var/www/html"
-	if alt := filepath.Join(sitesBasePath, domain); func() bool {
-		if _, err := os.Stat(alt); err == nil {
-			return true
-		}
-		return false
-	}() {
-		storageDir = filepath.Join(sitesBasePath, domain)
-	}
+	base := strings.TrimPrefix(domain, "www.")
+	storageDir := filepath.Join(sitesBasePath, base)
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
 		return "", err
 	}

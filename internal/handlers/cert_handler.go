@@ -360,7 +360,7 @@ server {
     ssl_prefer_server_ciphers on;
     
     # Root directory for serving files
-    root /var/www/html;
+    root /var/www/html/sites/{{.Domain}};
     index {{.Index}};
     
     # Access and error logs
@@ -542,7 +542,7 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	response := gin.H{
 		"status":          "success",
 		"domain":          domain,
-		"path":            "/var/www/html",
+		"path":            storageDir,
 		"nginx_conf":      configFilename,
 		"sites_available": configPath,
 		"sites_enabled":   enabledPath,
