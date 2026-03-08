@@ -1,14 +1,16 @@
-## Base URL
+## 1. External Custom-Domain / Sites API (port 8080)
 
-- Default: `http://<host>:8080`
+- **Base URL:** `http://<CUSTOM_DOMAIN_SERVER_IP>:8080`
+- In your current environment: `http://89.167.105.57:8080`
+- No auth is defined here; this service is intended to run on an internal/private network.
 
 ---
 
-## Health
+## 1.1 Health
 
 ### GET `/health`
 
-- **Description:** Health check endpoint.
+- **Description:** Health check.
 - **Request:** No body.
 - **Responses:**
   - `200 OK`
@@ -21,7 +23,7 @@
 
 ---
 
-## Certificates
+## 1.2 Certificates
 
 ### POST `/cert/generate`
 
@@ -63,7 +65,7 @@
     ```json
     {
       "status": "error",
-      "error": "<certbot output>"
+      "error": "<certbot output or error>"
     }
     ```
 
@@ -165,7 +167,7 @@
       ]
     }
     ```
-
+ddd
   - `500 Internal Server Error`
 
     ```json
@@ -177,7 +179,7 @@
 
 ---
 
-## Storage / Site Files
+## 1.3 Storage / Site Files
 
 All storage endpoints require that a valid (non-expired, matching) certificate exists for the given `domain`. If not, a `400` error is returned with a message from the certificate verification.
 
@@ -190,9 +192,19 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
 - **Request (multipart/form-data):**
   - Fields:
     - `domain` (text, required)
-    - `files` (one or more file parts)
+    - `files` (one or more file parts; this **must** be the field name)
       - Normal files are written directly to the target directory.
       - `.zip` archives are extracted into the target directory; the archive itself is not kept.
+      - Paths inside the zip are preserved (for example, `dist/index.html` becomes `<storageDir>/dist/index.html`).
+      - Each processed zip is reported in the response as `"yourfile.zip (unzipped)"`; individual unzipped files are not listed separately.
+
+- **Example (curl):**
+
+  ```bash
+  curl -X POST http://<CUSTOM_DOMAIN_SERVER_IP>:8080/storage/store \
+    -F "domain=example.com" \
+    -F "files=@./site-bundle.zip"
+  ```
 
 - **Responses:**
   - `200 OK`
@@ -232,7 +244,19 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
   - Fields:
     - `domain` (text, required)
     - `index` (text, optional) – desired index file name; defaults to `index.html`.
-    - `files` (optional; same handling as `/storage/store`, supports `.zip`).
+    - `files` (optional; same semantics as `/storage/store`, supports `.zip`):
+      - Send one or more files under the `files` field.
+      - `.zip` archives are extracted into the selected storage directory; the archive itself is not kept.
+      - Zipped subpaths are preserved, and the response will include `"yourfile.zip (unzipped)"` to indicate success.
+
+- **Example (curl):**
+
+  ```bash
+  curl -X POST http://<CUSTOM_DOMAIN_SERVER_IP>:8080/storage/nginx \
+    -F "domain=example.com" \
+    -F "index=index.html" \
+    -F "files=@./site-bundle.zip"
+  ```
 
 - **Successful responses:**
   - `200 OK`
@@ -307,7 +331,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
 
 ---
 
-## Sites API
+## 1.4 Sites API
 
 These endpoints work against the directory tree under `SITE_BASE_PATH` (default `/var/www/html/sites`).
 
@@ -420,3 +444,232 @@ These endpoints work against the directory tree under `SITE_BASE_PATH` (default 
     }
     ```
 
+---
+
+## 2. Skillbanto App API (Custom Domains & Deployment)
+
+- **Base URLs (app):**
+  - Local dev: usually `http://localhost:5001`
+  - Production: `https://app.skillbanto.com`
+- All `/api/creator/...` routes require an authenticated creator (cookie-based session).
+
+These endpoints live in the Skillbanto app and orchestrate calls to the external custom-domain API above.
+
+---
+
+## 2.1 Creator custom-domain status & instructions
+
+- **File:** `server/routes/creator/customDomainRoutes.ts`
+- **Mount path:** `/api/creator/...`
+
+### GET `/api/creator/site/custom-domain`
+
+- **Description:** Get current custom-domain settings and DNS instructions for the logged-in creator.
+- **Responses:**
+  - `200 OK`
+
+    ```json
+    {
+      "customDomain": "foziakashif.online",
+      "status": "connected",
+      "verifiedAt": "2025-02-12T10:23:45.000Z",
+      "instructions": {
+        "cnameTarget": "mysub.skillbanto.com",
+        "apexTargets": ["89.167.105.57"],
+        "verificationHost": "verify.foziakashif.online",
+        "verificationCode": "sb-verify-abc123"
+      },
+      "guidance": null
+    }
+    ```
+
+  - `4xx/5xx`:
+
+    ```json
+    {
+      "error": "Failed to fetch custom domain",
+      "details": "<message>"
+    }
+    ```
+
+---
+
+## 2.2 Connect a creator site to a custom domain
+
+### POST `/api/creator/site/custom-domain/connect`
+
+- **Description:** Connect and deploy a creator site to a custom domain. This endpoint:
+  - Validates the domain.
+  - Optionally verifies DNS.
+  - Saves the domain to `users.customDomain`.
+  - Calls the external API (`/cert/generate` and `/storage/nginx`) via `deploySiteToCustomDomain`.
+  - Marks status as `"connected"`.
+
+- **Request (JSON):**
+
+  ```json
+  {
+    "domain": "foziakashif.online",
+    "skipDnsCheck": false
+  }
+  ```
+
+  - `domain` (string, required)
+  - `skipDnsCheck` (boolean, optional) – if true, skips DNS verification.
+
+- **Responses:**
+  - `200 OK`
+
+    ```json
+    {
+      "success": true,
+      "domain": "foziakashif.online",
+      "status": "connected"
+    }
+    ```
+
+  - Possible `4xx/5xx`:
+
+    ```json
+    {
+      "error": "domain is required"
+    }
+    ```
+
+    ```json
+    {
+      "error": "Enter a valid domain like learn.mybrand.com"
+    }
+    ```
+
+    ```json
+    {
+      "error": "DNS not configured correctly for this domain",
+      "details": []
+    }
+    ```
+
+    ```json
+    {
+      "error": "Failed to connect custom domain",
+      "details": "<error message>"
+    }
+    ```
+
+---
+
+## 2.3 Disconnect a custom domain
+
+### DELETE `/api/creator/site/custom-domain`
+
+- **Description:** Clear the custom-domain mapping on the creator.
+- **Responses:**
+  - `200 OK`
+
+    ```json
+    {
+      "success": true
+    }
+    ```
+
+- Side effects:
+  - `customDomain = null`
+  - `customDomainStatus = "not_connected"`
+  - `customDomainVerificationCode = null`
+  - `customDomainVerifiedAt = null`
+
+---
+
+## 2.4 Creator profile (logo, favicon, subdomain, etc.)
+
+- **File:** `server/routes/creator/gamificationRoutes.ts`
+
+### GET `/api/creator/profile`
+
+- **Description:** Fetch basic creator/site settings.
+- **Response `200 OK` (simplified):**
+
+  ```json
+  {
+    "subDomain": "dfiles",
+    "logo": "https://doip65r0xfpnv.cloudfront.net/.../logo.png",
+    "favicon": "https://doip65r0xfpnv.cloudfront.net/.../favicon.png",
+    "colorPalette": ["#2C3E50"],
+    "name": "Creator Name",
+    "title": "Tagline",
+    "profileImage": "...",
+    "bio": "...",
+    "customDomain": "rozeena.online",
+    "customDomainStatus": "connected"
+  }
+  ```
+
+### PUT `/api/creator/profile`
+
+- **Description:** Update creator site/profile settings (subdomain, branding, etc.).
+- **Request (partial JSON):**
+
+  ```json
+  {
+    "subDomain": "dfiles",
+    "logo": "https://doip65r0xfpnv.cloudfront.net/.../logo.png",
+    "favicon": "https://doip65r0xfpnv.cloudfront.net/.../favicon.png",
+    "colorPalette": ["#2C3E50"],
+    "name": "Creator Name",
+    "title": "Title",
+    "profileImage": "...",
+    "bio": "...",
+    "skillToTeach": "...",
+    "productType": "...",
+    "description": "...",
+    "benefit": "...",
+    "ideaName": "...",
+    "socialMessage": "..."
+  }
+  ```
+
+- **Response `200 OK`:**
+
+  ```json
+  {
+    "success": true,
+    "message": "Profile updated successfully",
+    "subDomain": "dfiles"
+  }
+  ```
+
+---
+
+## 2.5 Image uploads for logo / favicon / branding
+
+- **Backend file:** `server/routes/creator/s3Upload.ts`
+
+### POST `/api/creator/s3-upload/image`
+
+- **Description:** Generate a presigned S3 URL and resulting CDN URL for image uploads (logo, favicon, branding).
+- **Request (JSON):**
+
+  ```json
+  {
+    "fileName": "logo.png",
+    "contentType": "image/png",
+    "prefix": "branding"
+  }
+  ```
+
+- **Response `200 OK`:**
+
+  ```json
+  {
+    "success": true,
+    "key": "branding/file-<timestamp>-<rand>.png",
+    "url": "<presigned-PUT-url>",
+    "fileUrl": "https://doip65r0xfpnv.cloudfront.net/branding/file-...png",
+    "message": "Image upload URL generated successfully"
+  }
+  ```
+
+- **Typical flow:**
+  1. Frontend calls `/api/creator/s3-upload/image` to get `url` and `fileUrl`.
+  2. Frontend `PUT`s the file to `url`.
+  3. Frontend stores `fileUrl` in `logo` / `favicon` fields and then calls `PUT /api/creator/profile`.
