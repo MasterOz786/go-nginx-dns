@@ -330,9 +330,6 @@ func generateNginxConfig(domain string, certPath, keyPath, indexName string) str
 	// normalize names
 	base := strings.TrimPrefix(domain, "www.")
 	www := "www." + base
-	if indexName == "" {
-		indexName = "index.html"
-	}
 	nginxTemplate := `
     # HTTPS Nginx configuration for ` + base + `
     # Generated automatically - Certificate verified
@@ -361,7 +358,7 @@ server {
     
     # Root directory for serving files
     root /var/www/html/sites/{{.Domain}};
-    index {{.Index}};
+    index {{.Index}} index.html;
     
     # Access and error logs
     access_log /var/log/nginx/{{.Domain}}_access.log;
