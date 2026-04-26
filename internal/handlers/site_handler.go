@@ -197,6 +197,46 @@ func prepareSiteStorage(domain string) (string, error) {
 	return storageDir, nil
 }
 
+func parseStorageMode(modeRaw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(modeRaw))
+	if mode == "" {
+		return "upsert", nil
+	}
+	switch mode {
+	case "upsert", "replace_all":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid mode %q, expected upsert or replace_all", modeRaw)
+	}
+}
+
+func listRelativeFiles(baseDir string) (map[string]struct{}, error) {
+	result := make(map[string]struct{})
+	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
+		return result, nil
+	}
+
+	err := filepath.WalkDir(baseDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(baseDir, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		result[rel] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // storeUploadedFiles handles the common multipart file handling logic used by
 // both StoreFiles and GenerateAndStoreNginxConfig. It writes each provided
 // file to disk under storageDir. If an uploaded file is a zip archive it is
@@ -319,10 +359,66 @@ func StoreFiles(c *gin.Context) {
 		return
 	}
 
+	mode, err := parseStorageMode(c.DefaultPostForm("mode", "upsert"))
+	if err != nil {
+		c.JSON(400, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
+	beforeFiles, err := listRelativeFiles(storageDir)
+	if err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to inspect existing files: %v", err)})
+		return
+	}
+
+	if mode == "replace_all" {
+		entries, readErr := os.ReadDir(storageDir)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to prepare storage directory: %v", readErr)})
+			return
+		}
+		for _, entry := range entries {
+			removePath := filepath.Join(storageDir, entry.Name())
+			if rmErr := os.RemoveAll(removePath); rmErr != nil {
+				c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to clean storage directory: %v", rmErr)})
+				return
+			}
+		}
+	}
+
 	storedFiles, failedFiles, fileErr := storeUploadedFiles(c, storageDir)
 	if fileErr != nil {
 		c.JSON(400, gin.H{"status": "error", "error": fileErr.Error()})
 		return
+	}
+
+	afterFiles, err := listRelativeFiles(storageDir)
+	if err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to inspect stored files: %v", err)})
+		return
+	}
+
+	created := []string{}
+	updated := []string{}
+	deleted := []string{}
+	unchanged := []string{}
+
+	for p := range afterFiles {
+		if _, existed := beforeFiles[p]; existed {
+			updated = append(updated, p)
+		} else {
+			created = append(created, p)
+		}
+	}
+	for p := range beforeFiles {
+		if _, stillExists := afterFiles[p]; !stillExists {
+			deleted = append(deleted, p)
+		}
+	}
+	for p := range beforeFiles {
+		if _, stillExists := afterFiles[p]; stillExists {
+			unchanged = append(unchanged, p)
+		}
 	}
 
 	response := gin.H{
@@ -330,6 +426,13 @@ func StoreFiles(c *gin.Context) {
 		"domain":  domain,
 		"path":    storageDir,
 		"stored":  storedFiles,
+		"mode":    mode,
+		"summary": gin.H{
+			"created":   created,
+			"updated":   updated,
+			"deleted":   deleted,
+			"unchanged": unchanged,
+		},
 		"message": "Files stored successfully after certificate verification",
 	}
 	if len(failedFiles) > 0 {

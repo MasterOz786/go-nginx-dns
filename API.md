@@ -192,6 +192,9 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
 - **Request (multipart/form-data):**
   - Fields:
     - `domain` (text, required)
+    - `mode` (text, optional) - `upsert` (default) or `replace_all`
+      - `upsert`: overwrite matching uploaded paths and keep other existing files.
+      - `replace_all`: clear all existing files under the domain directory before writing new uploads.
     - `files` (one or more file parts; this **must** be the field name)
       - Normal files are written directly to the target directory.
       - `.zip` archives are extracted into the target directory; the archive itself is not kept.
@@ -214,10 +217,17 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       "status": "success",
       "domain": "example.com",
       "path": "/var/www/html/sites/example.com",
+      "mode": "upsert",
       "stored": [
         "index.html",
         "assets.zip (unzipped)"
       ],
+      "summary": {
+        "created": ["index.html"],
+        "updated": ["assets/app.js"],
+        "deleted": [],
+        "unchanged": ["favicon.ico"]
+      },
       "message": "Files stored successfully after certificate verification",
       "failed": [
         "badfile.js: <error message>"
@@ -244,6 +254,9 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
   - Fields:
     - `domain` (text, required)
     - `index` (text, optional) – desired index file name; defaults to `index.html`.
+    - `mode` (text, optional) - `upsert` (default) or `replace_all`
+      - `upsert`: overwrite matching uploaded paths and keep other existing files.
+      - `replace_all`: clear all existing files under the domain directory before writing new uploads.
     - `files` (optional; same semantics as `/storage/store`, supports `.zip`):
       - Send one or more files under the `files` field.
       - `.zip` archives are extracted into `/var/www/html/sites/<domain-without-www>`; the archive itself is not kept.
@@ -266,6 +279,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       "status": "success",
       "domain": "example.com",
       "path": "/var/www/html/sites/example.com",
+      "mode": "replace_all",
       "nginx_conf": "example.com.conf",
       "sites_available": "/etc/nginx/sites-available/example.com.conf",
       "sites_enabled": "/etc/nginx/sites-enabled/example.com.conf",
@@ -276,6 +290,12 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       ],
       "cert_path": "/etc/letsencrypt/live/example.com/fullchain.pem",
       "key_path": "/etc/letsencrypt/live/example.com/privkey.pem",
+      "summary": {
+        "created": ["index.html", "assets/app.js"],
+        "updated": [],
+        "deleted": ["old.bundle.js"],
+        "unchanged": []
+      },
       "message": "Nginx configuration generated and files stored successfully",
       "failed": [
         "badfile.js: <error message>"
@@ -299,6 +319,13 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
     {
       "status": "error",
       "error": "Certificate is not verified for domain: example.com"
+    }
+    ```
+
+    ```json
+    {
+      "status": "error",
+      "error": "invalid mode \"replace\", expected upsert or replace_all"
     }
     ```
 

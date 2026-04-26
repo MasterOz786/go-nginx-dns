@@ -434,6 +434,12 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		return
 	}
 
+	mode, err := parseStorageMode(c.DefaultPostForm("mode", "upsert"))
+	if err != nil {
+		c.JSON(400, gin.H{"status": "error", "error": err.Error()})
+		return
+	}
+
 	// Verify certificate exists and is valid
 	isValid, verifyMsg := verifyCertificateForDomain(domain)
 	if !isValid {
@@ -470,6 +476,27 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	if err != nil {
 		c.JSON(400, gin.H{"status": "error", "error": err.Error()})
 		return
+	}
+
+	beforeFiles, err := listRelativeFiles(storageDir)
+	if err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to inspect existing files: %v", err)})
+		return
+	}
+
+	if mode == "replace_all" {
+		entries, readErr := os.ReadDir(storageDir)
+		if readErr != nil && !os.IsNotExist(readErr) {
+			c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to prepare storage directory: %v", readErr)})
+			return
+		}
+		for _, entry := range entries {
+			removePath := filepath.Join(storageDir, entry.Name())
+			if rmErr := os.RemoveAll(removePath); rmErr != nil {
+				c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to clean storage directory: %v", rmErr)})
+				return
+			}
+		}
 	}
 
 	// config filename used in several places below
@@ -517,6 +544,34 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		return
 	}
 
+	afterFiles, err := listRelativeFiles(storageDir)
+	if err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("failed to inspect stored files: %v", err)})
+		return
+	}
+
+	created := []string{}
+	updated := []string{}
+	deleted := []string{}
+	unchanged := []string{}
+	for p := range afterFiles {
+		if _, existed := beforeFiles[p]; existed {
+			updated = append(updated, p)
+		} else {
+			created = append(created, p)
+		}
+	}
+	for p := range beforeFiles {
+		if _, stillExists := afterFiles[p]; !stillExists {
+			deleted = append(deleted, p)
+		}
+	}
+	for p := range beforeFiles {
+		if _, stillExists := afterFiles[p]; stillExists {
+			unchanged = append(unchanged, p)
+		}
+	}
+
 	// ensure config filename is reported
 	if storedFiles == nil {
 		storedFiles = []string{}
@@ -540,6 +595,7 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		"status":          "success",
 		"domain":          domain,
 		"path":            storageDir,
+		"mode":            mode,
 		"nginx_conf":      configFilename,
 		"sites_available": configPath,
 		"sites_enabled":   enabledPath,
@@ -547,6 +603,12 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		"stored":          storedFiles,
 		"cert_path":       certPath,
 		"key_path":        keyPath,
+		"summary": gin.H{
+			"created":   created,
+			"updated":   updated,
+			"deleted":   deleted,
+			"unchanged": unchanged,
+		},
 		"message":         "Nginx configuration generated and files stored successfully",
 	}
 
