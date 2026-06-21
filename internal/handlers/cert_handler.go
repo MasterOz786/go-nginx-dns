@@ -12,17 +12,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// nginxConfDir is where per-site .conf files are written. Amazon Linux /
-// RHEL-style nginx packages use /etc/nginx/conf.d; Debian/Ubuntu use
-// sites-available/sites-enabled. Override with NGINX_CONF_DIR.
-var nginxConfDir = "/etc/nginx/conf.d"
-
-func init() {
-	if env := os.Getenv("NGINX_CONF_DIR"); env != "" {
-		nginxConfDir = env
-	}
-}
-
 type CertRequest struct {
 	Domain      string `json:"domain" binding:"required"`
 	Email       string `json:"email" binding:"required"`
@@ -513,18 +502,15 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	// config filename used in several places below
 	configFilename := domain + ".conf"
 
-	// Write nginx configuration directly into conf.d (EC2 / RHEL layout).
-	if err := os.MkdirAll(nginxConfDir, 0755); err != nil {
-		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to create %s: %v", nginxConfDir, err)})
+	layout, err := discoverNginxLayout()
+	if err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": err.Error()})
 		return
 	}
 
-	configPath := filepath.Join(nginxConfDir, configFilename)
-	if err := os.WriteFile(configPath, []byte(nginxConfig), 0644); err != nil {
-		c.JSON(500, gin.H{
-			"status": "error",
-			"error":  fmt.Sprintf("Failed to write nginx config: %v", err),
-		})
+	configPath, enabledPath, err := writeNginxSiteConfig(layout, configFilename, nginxConfig)
+	if err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": err.Error()})
 		return
 	}
 
@@ -583,14 +569,16 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"status":          "success",
-		"domain":          domain,
-		"path":            storageDir,
-		"mode":            mode,
-		"nginx_conf":      configFilename,
-		"nginx_conf_path": configPath,
-		"nginx_conf_dir":  nginxConfDir,
-		"index_file":      indexName,
+		"status":           "success",
+		"domain":           domain,
+		"path":             storageDir,
+		"mode":             mode,
+		"nginx_conf":       configFilename,
+		"nginx_conf_path":  configPath,
+		"nginx_conf_dir":   layout.WriteDir,
+		"nginx_layout":     layout.Layout,
+		"nginx_layout_src": layout.Source,
+		"index_file":       indexName,
 		"stored":          storedFiles,
 		"cert_path":       certPath,
 		"key_path":        keyPath,
@@ -600,7 +588,10 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 			"deleted":   deleted,
 			"unchanged": unchanged,
 		},
-		"message":         "Nginx configuration generated and files stored successfully",
+		"message":          "Nginx configuration generated and files stored successfully",
+	}
+	if enabledPath != "" {
+		response["nginx_enabled_path"] = enabledPath
 	}
 
 	if len(failedFiles) > 0 {

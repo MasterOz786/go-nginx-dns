@@ -4,6 +4,70 @@
 - In your current environment: `http://89.167.105.57:8080`
 - No auth is defined here; this service is intended to run on an internal/private network.
 
+**Environment variables:**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SITE_BASE_PATH` | `/var/www/html/sites` | Root directory for per-domain site files |
+| `NGINX_CONF_DIR` | *(auto-detected)* | Optional override; skips auto-discovery and writes vhost configs directly to this directory |
+
+**Nginx layout discovery**
+
+`/storage/nginx` does not hardcode a config path. At request time the service:
+
+1. Runs `nginx -V` to locate the main config file (for example `/etc/nginx/nginx.conf`).
+2. Parses `include` directives in that file (and one level of nested non-glob includes).
+3. Chooses a write strategy based on what nginx actually loads:
+
+| Detected include pattern | `nginx_layout` | Config written to | Symlink |
+|--------------------------|----------------|-------------------|---------|
+| `conf.d/*.conf` | `conf.d` | `/etc/nginx/conf.d/<domain>.conf` | none |
+| `sites-enabled/*` | `sites-available` | `/etc/nginx/sites-available/<domain>.conf` | → `sites-enabled/` |
+| `NGINX_CONF_DIR` set | `override` | `$NGINX_CONF_DIR/<domain>.conf` | none |
+
+4. Falls back to checking which of those directories exist if parsing fails.
+
+Typical results by platform:
+
+- **Amazon Linux / RHEL / EC2:** `conf.d` → `/etc/nginx/conf.d/`
+- **Debian / Ubuntu:** `sites-available` → `/etc/nginx/sites-available/` + symlink in `/etc/nginx/sites-enabled/`
+
+**Verify layout on a host**
+
+Run on the target server before deploying:
+
+```bash
+# integration test (prints JSON report, checks dirs + nginx -t)
+go test -v -run TestNginxLayoutEnvironment ./internal/handlers/
+
+# or standalone JSON report
+go run ./cmd/nginx-layout-check/
+```
+
+Set `NGINX_LAYOUT_ENV_STRICT=1` with the test to fail when `NGINX_CONF_DIR` override is active (forces verification of auto-discovery).
+
+Example `go run ./cmd/nginx-layout-check/` output on EC2:
+
+```json
+{
+  "main_conf": "/etc/nginx/nginx.conf",
+  "nginx_root": "/etc/nginx",
+  "includes": [
+    "/etc/nginx/mime.types",
+    "/etc/nginx/conf.d/*.conf"
+  ],
+  "write_dir": "/etc/nginx/conf.d",
+  "layout": "conf.d",
+  "source": "include conf.d/*.conf",
+  "write_dir_exists": true,
+  "write_dir_writable": true,
+  "enable_dir_exists": false,
+  "sample_config_path": "/etc/nginx/conf.d/example.com.conf",
+  "nginx_test_ok": true,
+  "nginx_test_output": "nginx: configuration file /etc/nginx/nginx.conf test is successful"
+}
+```
+
 ---
 
 ## 1.1 Health
@@ -167,7 +231,6 @@
       ]
     }
     ```
-ddd
   - `500 Internal Server Error`
 
     ```json
@@ -248,7 +311,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
 
 ### POST `/storage/nginx`
 
-- **Description:** Generate an HTTPS nginx config for the domain, write it to `/etc/nginx/sites-available`, create a symlink in `/etc/nginx/sites-enabled`, ensure the per-site root directory exists at `/var/www/html/sites/<domain>`, optionally store additional site files into that directory, and reload nginx.
+- **Description:** Generate an HTTPS nginx config for the domain, auto-detect the correct nginx vhost directory from the running nginx installation, write `<domain>.conf` there (and symlink into `sites-enabled` when that layout is used), ensure the per-site root directory exists at `/var/www/html/sites/<domain>`, optionally store additional site files into that directory, run `nginx -t`, and reload nginx.
 
 - **Request (multipart/form-data):**
   - Fields:
@@ -262,6 +325,19 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       - `.zip` archives are extracted into `/var/www/html/sites/<domain-without-www>`; the archive itself is not kept.
       - Zipped subpaths are preserved, and the response will include `"yourfile.zip (unzipped)"` to indicate success.
 
+- **Response fields (success):**
+
+  | Field | Type | Description |
+  |-------|------|-------------|
+  | `nginx_conf` | string | Config filename (for example `example.com.conf`) |
+  | `nginx_conf_path` | string | Absolute path where the config file was written |
+  | `nginx_conf_dir` | string | Directory used for vhost configs (discovered or overridden) |
+  | `nginx_layout` | string | `"conf.d"`, `"sites-available"`, or `"override"` |
+  | `nginx_layout_src` | string | How the layout was determined (matched `include` directive or fallback reason) |
+  | `nginx_enabled_path` | string | Present on Debian-style layouts; symlink path in `sites-enabled` |
+  | `nginx_test` | string | Output of `nginx -t` |
+  | `nginx_reload` | string | Reload result (`success (systemctl reload nginx)`, `success (nginx -s reload)`, or `failed (...)`) |
+
 - **Example (curl):**
 
   ```bash
@@ -272,7 +348,7 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
   ```
 
 - **Successful responses:**
-  - `200 OK`
+  - `200 OK` — **conf.d layout** (Amazon Linux / RHEL / EC2)
 
     ```json
     {
@@ -281,8 +357,10 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       "path": "/var/www/html/sites/example.com",
       "mode": "replace_all",
       "nginx_conf": "example.com.conf",
-      "sites_available": "/etc/nginx/sites-available/example.com.conf",
-      "sites_enabled": "/etc/nginx/sites-enabled/example.com.conf",
+      "nginx_conf_path": "/etc/nginx/conf.d/example.com.conf",
+      "nginx_conf_dir": "/etc/nginx/conf.d",
+      "nginx_layout": "conf.d",
+      "nginx_layout_src": "include /etc/nginx/conf.d/*.conf",
       "index_file": "index.html",
       "stored": [
         "example.com.conf",
@@ -300,7 +378,37 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       "failed": [
         "badfile.js: <error message>"
       ],
-      "nginx_test": "nginx: the configuration file ...",
+      "nginx_test": "nginx: the configuration file /etc/nginx/nginx.conf test is successful",
+      "nginx_reload": "success (systemctl reload nginx)"
+    }
+    ```
+
+  - `200 OK` — **sites-available layout** (Debian / Ubuntu)
+
+    ```json
+    {
+      "status": "success",
+      "domain": "example.com",
+      "path": "/var/www/html/sites/example.com",
+      "mode": "upsert",
+      "nginx_conf": "example.com.conf",
+      "nginx_conf_path": "/etc/nginx/sites-available/example.com.conf",
+      "nginx_conf_dir": "/etc/nginx/sites-available",
+      "nginx_enabled_path": "/etc/nginx/sites-enabled/example.com.conf",
+      "nginx_layout": "sites-available",
+      "nginx_layout_src": "include /etc/nginx/sites-enabled/*",
+      "index_file": "index.html",
+      "stored": ["example.com.conf", "index.html"],
+      "cert_path": "/etc/letsencrypt/live/example.com/fullchain.pem",
+      "key_path": "/etc/letsencrypt/live/example.com/privkey.pem",
+      "summary": {
+        "created": ["index.html"],
+        "updated": [],
+        "deleted": [],
+        "unchanged": []
+      },
+      "message": "Nginx configuration generated and files stored successfully",
+      "nginx_test": "nginx: the configuration file /etc/nginx/nginx.conf test is successful",
       "nginx_reload": "success (systemctl reload nginx)"
     }
     ```
@@ -329,7 +437,14 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
     }
     ```
 
-  - `500 Internal Server Error` (for example, `nginx -t` failure)
+  - `500 Internal Server Error` (for example, layout discovery failure or `nginx -t` failure)
+
+    ```json
+    {
+      "status": "error",
+      "error": "could not determine nginx config directory: ..."
+    }
+    ```
 
     ```json
     {
@@ -338,10 +453,12 @@ All storage endpoints require that a valid (non-expired, matching) certificate e
       "details": {
         "status": "success",
         "domain": "example.com",
-        "path": "/var/www/html",
+        "path": "/var/www/html/sites/example.com",
         "nginx_conf": "example.com.conf",
-        "sites_available": "/etc/nginx/sites-available/example.com.conf",
-        "sites_enabled": "/etc/nginx/sites-enabled/example.com.conf",
+        "nginx_conf_path": "/etc/nginx/conf.d/example.com.conf",
+        "nginx_conf_dir": "/etc/nginx/conf.d",
+        "nginx_layout": "conf.d",
+        "nginx_layout_src": "include /etc/nginx/conf.d/*.conf",
         "index_file": "index.html",
         "stored": [
           "example.com.conf",
