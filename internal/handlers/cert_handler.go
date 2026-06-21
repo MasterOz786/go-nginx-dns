@@ -12,6 +12,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// nginxConfDir is where per-site .conf files are written. Amazon Linux /
+// RHEL-style nginx packages use /etc/nginx/conf.d; Debian/Ubuntu use
+// sites-available/sites-enabled. Override with NGINX_CONF_DIR.
+var nginxConfDir = "/etc/nginx/conf.d"
+
+func init() {
+	if env := os.Getenv("NGINX_CONF_DIR"); env != "" {
+		nginxConfDir = env
+	}
+}
+
 type CertRequest struct {
 	Domain      string `json:"domain" binding:"required"`
 	Email       string `json:"email" binding:"required"`
@@ -502,38 +513,18 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 	// config filename used in several places below
 	configFilename := domain + ".conf"
 
-	// Write nginx configuration to file
-	// Write config to sites-available and enable it in sites-enabled
-	sitesAvailable := "/etc/nginx/sites-available"
-	sitesEnabled := "/etc/nginx/sites-enabled"
-
-	if err := os.MkdirAll(sitesAvailable, 0755); err != nil {
-		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to create %s: %v", sitesAvailable, err)})
+	// Write nginx configuration directly into conf.d (EC2 / RHEL layout).
+	if err := os.MkdirAll(nginxConfDir, 0755); err != nil {
+		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to create %s: %v", nginxConfDir, err)})
 		return
 	}
 
-	if err := os.MkdirAll(sitesEnabled, 0755); err != nil {
-		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to create %s: %v", sitesEnabled, err)})
-		return
-	}
-
-	configPath := filepath.Join(sitesAvailable, configFilename)
+	configPath := filepath.Join(nginxConfDir, configFilename)
 	if err := os.WriteFile(configPath, []byte(nginxConfig), 0644); err != nil {
 		c.JSON(500, gin.H{
 			"status": "error",
 			"error":  fmt.Sprintf("Failed to write nginx config: %v", err),
 		})
-		return
-	}
-
-	// Create or replace symlink in sites-enabled
-	enabledPath := filepath.Join(sitesEnabled, configFilename)
-	// remove existing file/symlink if present
-	if _, err := os.Lstat(enabledPath); err == nil {
-		_ = os.Remove(enabledPath)
-	}
-	if err := os.Symlink(configPath, enabledPath); err != nil {
-		c.JSON(500, gin.H{"status": "error", "error": fmt.Sprintf("Failed to enable site: %v", err)})
 		return
 	}
 
@@ -597,8 +588,8 @@ func GenerateAndStoreNginxConfig(c *gin.Context) {
 		"path":            storageDir,
 		"mode":            mode,
 		"nginx_conf":      configFilename,
-		"sites_available": configPath,
-		"sites_enabled":   enabledPath,
+		"nginx_conf_path": configPath,
+		"nginx_conf_dir":  nginxConfDir,
 		"index_file":      indexName,
 		"stored":          storedFiles,
 		"cert_path":       certPath,
